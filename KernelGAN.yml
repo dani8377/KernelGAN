@@ -1,3 +1,4 @@
+name: KernelGAN
 channels:
   - pytorch
   - defaults
