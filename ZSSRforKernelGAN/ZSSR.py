@@ -131,36 +131,35 @@ class ZSSR:
         # Return the final post processed output.
         # noinspection PyUnboundLocalVariable
         return post_processed_output
+    
 
     def build_network(self, meta):
         with self.model.as_default():
             # Learning rate tensor
-            self.learning_rate_t = tf.placeholder(tf.float32, name='learning_rate')
+            self.learning_rate_t = tf.Variable(meta.learning_rate, dtype=tf.float32, name='learning_rate')
 
             # Input image
-            self.lr_son_t = tf.placeholder(tf.float32, name='lr_son')
+            self.lr_son_t = tf.Variable(initial_value=tf.zeros(shape=[1, None, None, 3]), dtype=tf.float32, name='lr_son')
 
             # Ground truth (supervision)
-            self.hr_father_t = tf.placeholder(tf.float32, name='hr_father')
+            self.hr_father_t = tf.Variable(initial_value=tf.zeros(shape=[1, None, None, 3]), dtype=tf.float32, name='hr_father')
 
             # Loss map
-            self.loss_map_t = tf.placeholder(tf.float32, name='loss_map')
+            self.loss_map_t = tf.Variable(initial_value=tf.zeros(shape=[1, None, None, 3]), dtype=tf.float32, name='loss_map')
 
             # Filters
-            self.filters_t = [tf.get_variable(shape=meta.filter_shape[ind], name='filter_%d' % ind,
-                                              initializer=tf.random_normal_initializer(
-                                                  stddev=np.sqrt(meta.init_variance / np.prod(
-                                                      meta.filter_shape[ind][0:3]))))
-                              for ind in range(meta.depth)]
+            self.filters_t = [tf.Variable(initial_value=tf.random.normal(shape=meta.filter_shape[ind], stddev=np.sqrt(meta.init_variance / np.prod(meta.filter_shape[ind][0:3]))),
+                                        name='filter_%d' % ind)
+                            for ind in range(meta.depth)]
 
             # Activate filters on layers one by one (this is just building the graph, no calculation is done here)
             self.layers_t = [self.lr_son_t] + [None] * meta.depth
             for l in range(meta.depth - 1):
-                self.layers_t[l + 1] = tf.nn.relu(tf.nn.conv2d(self.layers_t[l], self.filters_t[l], [1, 1, 1, 1], "SAME", name='layer_%d' % (l + 1)))
+                self.layers_t[l + 1] = tf.nn.relu(tf.nn.conv2d(self.layers_t[l], self.filters_t[l], strides=[1, 1, 1, 1], padding="SAME", name='layer_%d' % (l + 1)))
 
             # Last conv layer (Separate because no ReLU here)
             l = meta.depth - 1
-            self.layers_t[-1] = tf.nn.conv2d(self.layers_t[l], self.filters_t[l], [1, 1, 1, 1], "SAME", name='layer_%d' % (l + 1))
+            self.layers_t[-1] = tf.nn.conv2d(self.layers_t[l], self.filters_t[l], strides=[1, 1, 1, 1], padding="SAME", name='layer_%d' % (l + 1))
 
             # Output image (Add last conv layer result to input, residual learning with global skip connection)
             self.net_output_t = self.layers_t[-1] + self.conf.learn_residual * self.lr_son_t
@@ -169,23 +168,15 @@ class ZSSR:
             self.loss_t = tf.reduce_mean(tf.reshape(tf.abs(self.net_output_t - self.hr_father_t) * self.loss_map_t, [-1]))
 
             # Apply adam optimizer
-            self.train_op = tf.train.AdamOptimizer(learning_rate=self.learning_rate_t).minimize(self.loss_t)
-            # self.init_op = tf.initialize_all_variables()
-            self.init_op = tf.global_variables_initializer()
+            self.optimizer = tf.optimizers.Adam(learning_rate=self.learning_rate_t)
+
 
     def init_sess(self, init_weights=True):
-        # Sometimes we only want to initialize some meta-params but keep the weights as they were
         if init_weights:
-            # These are for GPU consumption, preventing TF to catch all available GPUs
-            config = tf.ConfigProto()
-            config.gpu_options.allow_growth = True
-
-            # Initialize computational graph session
-            self.sess = tf.Session(graph=self.model, config=config)
-
-            # Initialize weights
-            self.sess.run(self.init_op)
-
+            # Initialize all variables
+            for variable in self.model.variables:
+                variable.assign(tf.zeros_like(variable))
+            
         # Initialize all counters etc
         self.loss = [None] * self.conf.max_iters
         self.mse, self.mse_rec, self.interp_mse, self.interp_rec_mse, self.mse_steps = [], [], [], [], []
@@ -193,32 +184,36 @@ class ZSSR:
         self.learning_rate = self.conf.learning_rate
         self.learning_rate_change_iter_nums = [0]
 
+
     def forward_backward_pass(self, lr_son, hr_father, cropped_loss_map):
         # First gate for the lr-son into the network is interpolation to the size of the father
-        # Note: we specify both output_size and scale_factor. best explained by example: say father size is 9 and sf=2,
-        # small_son size is 4. if we upscale by sf=2 we get wrong size, if we upscale to size 9 we get wrong sf.
-        # The current imresize implementation supports specifying both.
         interpolated_lr_son = imresize(lr_son, self.sf, hr_father.shape, self.conf.upscale_method)
         # Create feed dict
-        feed_dict = {'learning_rate:0': self.learning_rate,
-                     'lr_son:0': np.expand_dims(interpolated_lr_son, 0),
-                     'hr_father:0': np.expand_dims(hr_father, 0),
-                     'loss_map:0': np.expand_dims(cropped_loss_map, 0)}
+        self.lr_son_t.assign(np.expand_dims(interpolated_lr_son, 0))
+        self.hr_father_t.assign(np.expand_dims(hr_father, 0))
+        self.loss_map_t.assign(np.expand_dims(cropped_loss_map, 0))
 
-        # Run network
-        _, self.loss[self.iter], train_output = self.sess.run([self.train_op, self.loss_t, self.net_output_t],
-                                                              feed_dict)
-        return np.clip(np.squeeze(train_output), 0, 1)
+        with tf.GradientTape() as tape:
+            train_output = self.net_output_t
+            loss = self.loss_t
+        
+        gradients = tape.gradient(loss, self.model.variables)
+        self.optimizer.apply_gradients(zip(gradients, self.model.variables))
+        
+        self.loss[self.iter] = loss.numpy()
+        return np.clip(np.squeeze(train_output.numpy()), 0, 1)
+
 
     def forward_pass(self, lr_son, hr_father_shape=None):
         # First gate for the lr-son into the network is interpolation to the size of the father
         interpolated_lr_son = imresize(lr_son, self.sf, hr_father_shape, self.conf.upscale_method)
 
-        # Create feed dict
-        feed_dict = {'lr_son:0': np.expand_dims(interpolated_lr_son, 0)}
+        # Assign input tensor
+        self.lr_son_t.assign(np.expand_dims(interpolated_lr_son, 0))
 
         # Run network
-        return np.clip(np.squeeze(self.sess.run([self.net_output_t], feed_dict)), 0, 1)
+        return np.clip(np.squeeze(self.net_output_t.numpy()), 0, 1)
+
 
     def learning_rate_policy(self):
         # fit linear curve and check slope to determine whether to do nothing, reduce learning rate or finish
